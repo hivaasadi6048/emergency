@@ -1,0 +1,41 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Secrets — هرگز commit نشود (الزام security)
+.env
+.env.*
+*.pem
+*.key
+secrets/
+keystore/
+google-services.json
+key.properties
+
+# Backend (در Phase 2 تکمیل می‌شود)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.sqlite3
+/staticfiles/
+/media/
+
+# Flutter / Android (در Phase 1 تکمیل می‌شود)
+.dart_tool/
+.packages
+build/
+*.iml
+local.properties
+.gradle/
+
+# Node (web)
+node_modules/
+dist/
+
+# Backend local env (C-007/C-008 — هرگز commit نشود)
+backend/.localdb/
+backend/.venv/
+runserver.log

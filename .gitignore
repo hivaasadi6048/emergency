@@ -20,7 +20,7 @@ __pycache__/
 .venv/
 venv/
 *.sqlite3
-/staticfiles/
+backend/staticfiles/
 /media/
 
 # Flutter / Android (در Phase 1 تکمیل می‌شود)

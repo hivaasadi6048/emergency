@@ -21,9 +21,20 @@ SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 # TEST PHASE: the service URL is public. Tightened + CORS/CSRF pinned in Phase 11.
 ALLOWED_HOSTS = ["*"]
 
+# REQUIRED — the Render PostgreSQL Internal Database URL. A missing URL means
+# the env var was not linked; failing LOUDLY beats silently dialing localhost
+# (that exact confusion cost a failed build, change-log B-021).
+_DATABASE_URL = os.environ.get("DATABASE_URL")
+if not _DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL env var is missing — create the Render PostgreSQL instance "
+        "and link it to this Web Service (or paste its Internal Database URL "
+        "into the DATABASE_URL environment variable), then redeploy."
+    )
+
 DATABASES = {
     "default": dj_database_url.config(
-        default=os.environ.get("DATABASE_URL", ""),
+        default=_DATABASE_URL,
         conn_max_age=600,
     )
 }

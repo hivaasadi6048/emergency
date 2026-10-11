@@ -37,13 +37,14 @@ git push -u origin main
 | Root Directory | **`backend`** |
 | Runtime | **Python 3** |
 | Build Command | `bash build.sh` |
-| Start Command | `gunicorn config.wsgi:application --settings=config.settings.deploy --bind 0.0.0.0:$PORT` |
+| Start Command | `gunicorn config.wsgi:application --bind 0.0.0.0:$PORT` |
 
-5. **Environment variables** (بخش Advanced → Add Environment Variable) — سه تا اضافه کنید:
+5. **Environment variables** (بخش Environment → Add Environment Variable) — چهار تا اضافه کنید:
 
 | Key | Value |
 |---|---|
-| `DJANGO_SECRET_KEY` | یک رشته تصادفی طولانی (مثلاً از [this site](https://djecrety.ir)) |
+| `DJANGO_SETTINGS_MODULE` | `config.settings.deploy` |
+| `DJANGO_SECRET_KEY` | یک رشته تصادفی طولانی |
 | `OTP_TEST_MODE` | `1` |
 | `OTP_TEST_CODE` | یک کد ۶ رقمی دلخواه، مثلاً `123456` |
 

@@ -20,7 +20,13 @@ if [ ! -f "$JAR" ]; then
 fi
 ls -lh "$JAR"
 
-echo "=== 2) extract ==="
+echo "=== 2) stop leftover postgres (codespace wake keeps it alive → ETXTBSY) ==="
+if [ -f "$PGROOT/data/PG_VERSION" ]; then
+  "$PGROOT/bin/pg_ctl" -D "$PGROOT/data" stop 2>/dev/null || pkill -f "$PGROOT/bin/postgres" 2>/dev/null || true
+fi
+sleep 1
+
+echo "=== 3) extract ==="
 python - "$JAR" "$PGROOT" <<'PY'
 import zipfile, tarfile, io, sys, os
 jar, out = sys.argv[1], sys.argv[2]

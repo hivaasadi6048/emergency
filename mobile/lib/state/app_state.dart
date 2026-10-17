@@ -48,11 +48,14 @@ class AppState extends ChangeNotifier {
   bool get hasActiveSession => activeSession != null && !activeSession!.status.isTerminal;
 
   // ── auth ────────────────────────────────────────────────────────────────
+  /// Returns the dev-mode code when the backend provides one; empty string on
+  /// success WITHOUT a code (cloud/test-mode server); null on failure.
   Future<String?> requestOtp(String phone) async {
     _setError(null);
     notifyListeners();
     try {
-      return await authRepo.requestOtp(phone); // dev-mode code or null
+      final code = await authRepo.requestOtp(phone);
+      return code ?? '';
     } on ApiException catch (e) {
       _setError(e.persianMessage);
       notifyListeners();

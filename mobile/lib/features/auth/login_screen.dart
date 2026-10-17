@@ -15,6 +15,7 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _phone = TextEditingController();
   final _code = TextEditingController();
+  final _url = TextEditingController();
   String? _devCode;
   bool _otpSent = false;
   String? _fieldError;
@@ -43,6 +44,7 @@ class _LoginScreenState extends State<LoginScreen> {
     widget.state.removeListener(_onChange);
     _phone.dispose();
     _code.dispose();
+    _url.dispose();
     super.dispose();
   }
 
@@ -60,14 +62,19 @@ class _LoginScreenState extends State<LoginScreen> {
     }
     if (!mounted) return;
     setState(() {
-      if (code == null || code.isEmpty) {
-        // show the REAL cause (network vs validation) — never a misleading one
+      if (code == null) {
+        // real failure — the real cause is already in state.lastError
         _fieldError = widget.state.lastError ?? 'دریافت کد ناموفق بود؛ دوباره تلاش کنید.';
       } else {
         _fieldError = null;
         _otpSent = true;
-        _devCode = code;
-        _code.text = code; // dev-mode auto-fill
+        if (code.isNotEmpty) {
+          // dev-mode: backend echoed the code — show + auto-fill
+          _devCode = code;
+          _code.text = code;
+        } else {
+          _devCode = null; // cloud/test-mode: type the fixed server code
+        }
       }
     });
   }
@@ -84,6 +91,32 @@ class _LoginScreenState extends State<LoginScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          // Backend URL must be configurable BEFORE login (cloud/testing switch)
+          ExpansionTile(
+            dense: true,
+            title: const Text('تنظیمات سرور', style: TextStyle(fontSize: 13)),
+            subtitle: Text(state.client.baseUrl, style: const TextStyle(fontSize: 11)),
+            children: [
+              TextField(
+                controller: _url,
+                decoration: const InputDecoration(
+                  labelText: 'آدرس Backend',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 6),
+              OutlinedButton(
+                onPressed: () {
+                  final u = _url.text.trim();
+                  if (u.isNotEmpty) state.client.baseUrl = u;
+                  setState(() {});
+                },
+                child: const Text('ذخیره آدرس'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
           const Text('شماره موبایل شما تنها هویت شما در سیستم است (E.164).'),
           const SizedBox(height: 12),
           TextField(

@@ -3,6 +3,7 @@ package com.emergency.app.emergency_poc
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
+import java.util.UUID
 
 /**
  * File-backed location point queue (Phase 5): survives process death, bounded
@@ -11,6 +12,11 @@ import java.io.File
  * Phase 4 discovery (docs/phase-1/4 reports): OneUI silently suspends delivery
  * and process death loses the in-memory buffer — this queue makes points
  * durable until they are uploaded by the Dart side (C-014 bridge).
+ *
+ * C-016/C-017: every point carries a capture-time client_uuid (survives
+ * restarts — the dedupe key C-02) and the queue exposes acknowledge() so the
+ * Dart uploader drains it ONLY after the backend accepted the batch. The queue
+ * is therefore always exactly "what the server has not yet confirmed".
  */
 class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
 
@@ -28,6 +34,18 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
         if (points.size >= maxPoints) points.removeFirst()
         points.addLast(point)
         persist()
+    }
+
+    /** C-017: remove acked (server-confirmed) points; returns how many were removed.
+     *  Unknown uuids are ignored — ack is idempotent. */
+    @Synchronized
+    fun acknowledge(uuids: Set<String>): Int {
+        if (uuids.isEmpty()) return 0
+        val before = points.size
+        points.removeAll { it.clientUuid in uuids }
+        val removed = before - points.size
+        if (removed > 0) persist()
+        return removed
     }
 
     @Synchronized
@@ -48,11 +66,18 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
 
     private fun persist() {
         runCatching {
-            file.writeText(points.joinToString("\n") { serialize(it) })
+            // atomic-ish write (C-017): process death mid-write must not corrupt the queue
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(points.joinToString("\n") { serialize(it) })
+            if (!tmp.renameTo(file)) {
+                file.writeText(tmp.readText())
+                tmp.delete()
+            }
         }.onFailure { Log.e("PointQueue", "persist failed", it) }
     }
 
     private fun serialize(p: PocLocationPoint): String = JSONObject().apply {
+        put("uuid", p.clientUuid)
         put("lat", p.latitude)
         put("lng", p.longitude)
         put("acc", p.accuracyM ?: JSONObject.NULL)
@@ -72,6 +97,9 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
             bearingDeg = if (j.isNull("brg")) null else j.getDouble("brg").toFloat(),
             capturedAtMs = j.getLong("ts"),
             source = j.getString("src"),
+            // C-016: legacy pre-update lines have no uuid — mint one so no point is lost.
+            // One-time caveat: such legacy points may be uploaded once more (documented in phase-5-report).
+            clientUuid = if (j.isNull("uuid")) UUID.randomUUID().toString() else j.getString("uuid"),
         )
     }
 }

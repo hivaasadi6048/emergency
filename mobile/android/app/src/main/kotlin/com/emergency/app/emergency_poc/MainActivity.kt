@@ -82,6 +82,13 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "getNativeEmergencyState" -> result.success(nativeStateMap())
+                "getPendingPoints" -> result.success(pendingPointsList())
+                "ackUploadedPoints" -> {
+                    // C-017: Dart acks uuids ONLY after the backend returned 202 for the batch.
+                    val args = call.arguments as? Map<*, *>
+                    val uuids = (args?.get("uuids") as? List<*>)?.filterIsInstance<String>()?.toSet() ?: emptySet()
+                    result.success(PocNativeState.acknowledge(uuids))
+                }
                 else -> result.notImplemented()
             }
         }
@@ -173,6 +180,7 @@ class MainActivity : FlutterActivity() {
                 "accuracyM" to p.accuracyM,
                 "capturedAtMs" to p.capturedAtMs,
                 "source" to p.source,
+                "clientUuid" to p.clientUuid,
             )
         }
         return mapOf(
@@ -186,4 +194,18 @@ class MainActivity : FlutterActivity() {
             "permissions" to permissionSnapshot(),
         )
     }
+
+    /** C-017: the FULL un-acked queue (not just the last 20) with stable uuids —
+     *  this is the upload source of truth; replaces reading `points` for upload. */
+    private fun pendingPointsList(): List<Map<String, Any?>> =
+        PocNativeState.pointsSnapshot().map { p ->
+            mapOf(
+                "clientUuid" to p.clientUuid,
+                "latitude" to p.latitude,
+                "longitude" to p.longitude,
+                "accuracyM" to p.accuracyM,
+                "capturedAtMs" to p.capturedAtMs,
+                "source" to p.source,
+            )
+        }
 }

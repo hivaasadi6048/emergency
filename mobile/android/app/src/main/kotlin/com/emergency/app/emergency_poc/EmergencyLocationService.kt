@@ -23,7 +23,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** One collected location point. [capturedAtMs] is the device-side capture time (kept separate from receive time later). */
+/** One collected location point. [capturedAtMs] is the device-side capture time (kept separate from receive time later).
+ *  [clientUuid] (C-016) is born at capture time and lives in the persistent queue — it is the stable
+ *  dedupe key (C-02) across retries AND process restarts, unlike the previous Dart-side regeneration. */
 data class PocLocationPoint(
     val latitude: Double,
     val longitude: Double,
@@ -32,6 +34,7 @@ data class PocLocationPoint(
     val bearingDeg: Float?,
     val capturedAtMs: Long,
     val source: String,
+    val clientUuid: String,
 )
 
 /** Shared native state observed by the Flutter bridge. */
@@ -65,6 +68,12 @@ object PocNativeState {
         queue?.add(point)
         lastFixAtMs = point.capturedAtMs
     }
+
+    /** C-017: upload ack/drain — the Dart side calls this ONLY after the backend accepted the
+     *  batch (HTTP 202). Acked points leave the queue, so the queue is always exactly the
+     *  set of points the server has NOT yet confirmed. Survives process death. */
+    @Synchronized
+    fun acknowledge(uuids: Set<String>): Int = queue?.acknowledge(uuids) ?: 0
 
     @Synchronized
     fun pointsSnapshot(): List<PocLocationPoint> = queue?.snapshot() ?: emptyList()
@@ -253,6 +262,7 @@ class EmergencyLocationService : Service() {
             bearingDeg = if (location.hasBearing()) location.bearing else null,
             capturedAtMs = location.time,
             source = if (provider == LocationManager.GPS_PROVIDER) "FGS_GPS" else "FGS_${provider.uppercase()}",
+            clientUuid = java.util.UUID.randomUUID().toString(),
         )
         PocNativeState.addPoint(point)
         lastFixElapsedMs = SystemClock.elapsedRealtime()

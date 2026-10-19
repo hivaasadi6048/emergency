@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 import '../core/api/api_client.dart';
 import '../core/api/api_exception.dart';
 import '../core/native/emergency_native.dart';
-
 import '../data/repositories_impl.dart';
 import '../domain/entities.dart';
 import '../domain/usecases.dart';
@@ -40,9 +39,13 @@ class AppState extends ChangeNotifier {
   bool busy = false;
   Timer? _poll;
   bool _nativeStartAttempted = false;
-  // capturedAtMs -> client_uuid of points already handed to the upload queue;
-  // stable keys keep backend dedupe (C-02) correct across retries.
-  final Map<int, String> _uploadedPointKeys = {};
+  // C-016/C-017: client_uuid is born NATIVE-side at capture time and lives in the
+  // persistent queue — stable across restarts, so server dedupe (C-02) holds.
+  // This set is only a within-session upload guard (bounded, belt-and-braces).
+  final Set<String> _uploadedUuids = {};
+  // Points captured more than this before the current session's start belong to an
+  // older (already terminal) session and are discarded+acked instead of re-attributed.
+  static const int _sessionSkewSlackMs = 120000;
 
   bool get isLoggedIn => user != null;
   bool get hasActiveSession => activeSession != null && !activeSession!.status.isTerminal;
@@ -154,7 +157,7 @@ class AppState extends ChangeNotifier {
     try {
       final (session, _) = await startEmergency(triggerType: 'IN_APP_SOS');
       activeSession = session;
-      _uploadedPointKeys.clear(); // new session, fresh dedupe keys
+      _uploadedUuids.clear(); // new session, fresh upload guard
 
       // Permission gate: a fresh install has NO runtime permissions — request
       // them and wait briefly; without fine location the FGS cannot run and
@@ -317,58 +320,55 @@ class AppState extends ChangeNotifier {
   bool _isIngestable(EmergencyStatus s) =>
       s == EmergencyStatus.starting || s == EmergencyStatus.active || s == EmergencyStatus.degraded;
 
-  /// Reads the native point buffer (temp bridge) and uploads unseen points.
-  /// client_uuid keys are stable per capturedAtMs so retries dedupe on the
-  /// server (constraint C-02) instead of creating duplicate rows.
-
-  /// UUID derived from session id + capture time — stable across app restarts
-  /// (uuidV4 would break server-side dedupe after a process death, C-02).
-  String _stablePointUuid(String sessionId, int capturedMs) {
-    int h = 0x5a17;
-    final src = '$sessionId:$capturedMs';
-    for (final c in src.codeUnits) {
-      h = (h ^ c) * 0x01000193 & 0x7fffffff;
-    }
-    final hex = h.toRadixString(16).padLeft(8, '0') +
-        (capturedMs & 0xffffffff).toRadixString(16).padLeft(8, '0') +
-        sessionId.replaceAll('-', '').substring(0, 12);
-    final p = hex.padRight(32, '0').substring(0, 32);
-    return '${p.substring(0, 8)}-${p.substring(8, 12)}-4${p.substring(13, 16)}-8${p.substring(17, 20)}-${p.substring(20, 32)}';
-  }
-
+  /// Uploads the native pending queue (temp bridge, docs/change-log.md C-014/C-016/C-017).
+  /// Correctness contract:
+  ///  - client_uuid comes FROM the native queue (born at capture time) — stable across
+  ///    retries AND process restarts, so the backend's (session, client_uuid) dedupe holds;
+  ///  - points are acked (drained) ONLY after the backend accepted the batch — a crash
+  ///    between upload and ack causes a re-upload with the SAME uuid → duplicate is
+  ///    swallowed server-side, no duplicate rows, no lost points;
+  ///  - points older than the current session's start are drained WITHOUT upload (their
+  ///    session is already terminal and can no longer receive locations).
   Future<void> _uploadNativePoints(String sessionId) async {
-    final nativeState = await native.status();
-    final pointsRaw = (nativeState['points'] as List?) ?? const [];
+    final pending = await native.pendingPoints();
+    if (pending.isEmpty) return;
+
+    final startedAtMs = activeSession?.startedAt?.millisecondsSinceEpoch;
     final batch = <Map<String, dynamic>>[];
-    for (final p in pointsRaw) {
-      if (p is! Map) continue;
-      final m = Map<String, dynamic>.from(p);
-      final capturedMs = (m['capturedAtMs'] as num?)?.toInt();
-      if (capturedMs == null || _uploadedPointKeys.containsKey(capturedMs)) continue;
-      // DETERMINISTIC id: same (session, capturedAt) must always map to the
-      // same client_uuid so a re-upload after process restart dedupes on the
-      // server (constraint C-02) instead of creating duplicate rows.
-      final clientUuid = _stablePointUuid(sessionId, capturedMs);
-      _uploadedPointKeys[capturedMs] = clientUuid;
+    final staleUuids = <String>[];
+    for (final p in pending) {
+      final clientUuid = (p['clientUuid'] ?? '').toString();
+      final capturedMs = (p['capturedAtMs'] as num?)?.toInt();
+      if (clientUuid.isEmpty || capturedMs == null) continue;
+      if (_uploadedUuids.contains(clientUuid)) continue;
+      if (startedAtMs != null && capturedMs < startedAtMs - _sessionSkewSlackMs) {
+        staleUuids.add(clientUuid);
+        continue;
+      }
       batch.add({
         'client_uuid': clientUuid,
-        'latitude': m['latitude'],
-        'longitude': m['longitude'],
-        'accuracy_m': m['accuracyM'],
+        'latitude': p['latitude'],
+        'longitude': p['longitude'],
+        'accuracy_m': p['accuracyM'],
         'captured_at': DateTime.fromMillisecondsSinceEpoch(capturedMs, isUtc: true).toIso8601String(),
-        'source': (m['source'] ?? 'FGS_GPS').toString(),
+        'source': (p['source'] ?? 'FGS_GPS').toString(),
       });
     }
-    if (batch.isEmpty) return;
-    if (_uploadedPointKeys.length > 500) {
-      // keep the dedupe map bounded; old keys are long-consumed points
-      final keys = _uploadedPointKeys.keys.toList()..sort();
-      for (final k in keys.take(_uploadedPointKeys.length - 500)) {
-        _uploadedPointKeys.remove(k);
-      }
+
+    if (staleUuids.isNotEmpty) {
+      final drained = await native.ackUploadedPoints(staleUuids);
+      debugPrint('locations.staleDiscarded session=$sessionId requested=${staleUuids.length} drained=$drained');
     }
-    await emergencyRepo.uploadLocations(sessionId, batch);
-    debugPrint('locations.uploaded session=$sessionId count=${batch.length}');
+    if (batch.isEmpty) return;
+
+    await emergencyRepo.uploadLocations(sessionId, batch); // throws → nothing acked, retried next tick
+    _uploadedUuids.addAll(batch.map((b) => b['client_uuid'] as String));
+    if (_uploadedUuids.length > 500) {
+      // keep the guard bounded; acked points can never come back (drained natively)
+      _uploadedUuids.remove(_uploadedUuids.first);
+    }
+    final drained = await native.ackUploadedPoints(batch.map((b) => b['client_uuid'] as String).toList());
+    debugPrint('locations.uploaded session=$sessionId count=${batch.length} drained=$drained');
   }
 
   Future<void> _finishIfTerminal() async {

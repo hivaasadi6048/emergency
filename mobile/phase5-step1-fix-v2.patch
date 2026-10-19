@@ -1,0 +1,354 @@
+diff --git a/docs/change-log.md b/docs/change-log.md
+index a714369..e4e633f 100644
+--- a/docs/change-log.md
++++ b/docs/change-log.md
+@@ -20,6 +20,8 @@
+ | C-013 | 2026-10-04 | پل موقت Flutter↔Kotlin از کانال Phase 1 (`emergency.poc/native`) در EmergencyScreen استفاده شد | اتصال زودهنگام SOS→FGS→capability برای نمایش واقعی ACTIVE/DEGRADED/FAILED؛ فرمالیزه شدن با Pigeon به Phase 5 موکول شد | `mobile/lib/core/native/emergency_native.dart` | phase-4-report |
+ | C-014 | 2026-10-05 | **پل آپلود موقعیت**: بافر native → بچ `POST /api/v1/locations` با client_uuid پایدار per-point (dedupe سرور) — پیش‌نمایش لوله Phase 5 روی پل موقت | مالک خواستار دیدن موقعیت در اپ بود؛ همه قطعات موجود بودند | `lib/state/app_state.dart` | phase-4-report |
+ | C-015 | 2026-10-05 | watchdog تونل dev (`adb reverse tcp:8001`) به‌صورت حلقه background روی سیستم توسعه | تونل با هر قطع USB/restart دیمون adb می‌پرد و اپ NETWORK می‌دید | فرآیند background (فقط dev) | phase-4-report §5 |
++| C-017 | 2026-10-19 | **client_uuid از لحظه ثبت نقطه در سمت native ساخته و در صف پایدار ذخیره می‌شود** (`PocLocationPoint.clientUuid` + serialize/parse صف)؛ Dart به‌جای تولید uuid جدید هنگام آپلود، uuid ذخیره‌شده را می‌فرستد | باگ یافته بررسی فاز ۵: uuid قبلاً در Dart هنگام آپلود ساخته می‌شد و نقشه dedupe فقط in-memory بود → پس از ری‌استارت پروسه همان نقاط با uuid تازه دوباره آپلود و ردیف تکراری در DB ساخته می‌شد (نقض dedupe معیار C-02)؛ جایگزین رویکرد هش Dart در commit 0adb880 — چون آن روش پنجره ۲۰ نقطه‌ای و انتساب نقاط session قبلی به session جدید را حل نمی‌کرد | `EmergencyLocationService.kt`, `PersistentPointQueue.kt`, `lib/state/app_state.dart` | همین سند + تست process-restart روی A21s (فاز ۵) |
++| C-018 | 2026-10-19 | **معناشناسی ack/drain برای صف نقاط**: متدهای پل `getPendingPoints` (کل صف un-acked با uuid پایدار — نه فقط ۲۰ نقطه آخر) و `ackUploadedPoints` (تخلیه فقط بعد از پاسخ 202 سرور)؛ ذخیره اتمیک صف (tmp+rename)؛ نقاط قدیمی‌تر از شروع session جاری بدون آپلود تخلیه می‌شوند (بدون انتساب به session جدید) | صف هرگز تخلیه نمی‌شد (تا سقف 200 پر می‌شد) و Dart فقط ۲۰ نقطه آخر را می‌دید → قطعی شبکه بیش از ~۳ دقیقه یعنی گم‌شدن نقاط + آپلود مجدد بی‌مورد؛ صف حالا دقیقاً «آنچه سرور تأیید نکرده» است | `MainActivity.kt`, `PersistentPointQueue.kt`, `lib/core/native/emergency_native.dart`, `lib/state/app_state.dart` | همین سند + phase-5-report (در حال تهیه) |
+ 
+ ### اصلاحات باگ حین Phase 2 (چرخه TDD)
+ | ID | تاریخ | باگ | Fix |
+diff --git a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/EmergencyLocationService.kt b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/EmergencyLocationService.kt
+index f05faca..d370a35 100644
+--- a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/EmergencyLocationService.kt
++++ b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/EmergencyLocationService.kt
+@@ -23,7 +23,9 @@ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.Locale
+ 
+-/** One collected location point. [capturedAtMs] is the device-side capture time (kept separate from receive time later). */
++/** One collected location point. [capturedAtMs] is the device-side capture time (kept separate from receive time later).
++ *  [clientUuid] (C-016) is born at capture time and lives in the persistent queue — it is the stable
++ *  dedupe key (C-02) across retries AND process restarts, unlike the previous Dart-side regeneration. */
+ data class PocLocationPoint(
+     val latitude: Double,
+     val longitude: Double,
+@@ -32,6 +34,7 @@ data class PocLocationPoint(
+     val bearingDeg: Float?,
+     val capturedAtMs: Long,
+     val source: String,
++    val clientUuid: String,
+ )
+ 
+ /** Shared native state observed by the Flutter bridge. */
+@@ -66,6 +69,12 @@ object PocNativeState {
+         lastFixAtMs = point.capturedAtMs
+     }
+ 
++    /** C-017: upload ack/drain — the Dart side calls this ONLY after the backend accepted the
++     *  batch (HTTP 202). Acked points leave the queue, so the queue is always exactly the
++     *  set of points the server has NOT yet confirmed. Survives process death. */
++    @Synchronized
++    fun acknowledge(uuids: Set<String>): Int = queue?.acknowledge(uuids) ?: 0
++
+     @Synchronized
+     fun pointsSnapshot(): List<PocLocationPoint> = queue?.snapshot() ?: emptyList()
+ }
+@@ -253,6 +262,7 @@ class EmergencyLocationService : Service() {
+             bearingDeg = if (location.hasBearing()) location.bearing else null,
+             capturedAtMs = location.time,
+             source = if (provider == LocationManager.GPS_PROVIDER) "FGS_GPS" else "FGS_${provider.uppercase()}",
++            clientUuid = java.util.UUID.randomUUID().toString(),
+         )
+         PocNativeState.addPoint(point)
+         lastFixElapsedMs = SystemClock.elapsedRealtime()
+diff --git a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/MainActivity.kt b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/MainActivity.kt
+index 49bc03a..233e101 100644
+--- a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/MainActivity.kt
++++ b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/MainActivity.kt
+@@ -82,6 +82,13 @@ class MainActivity : FlutterActivity() {
+                     result.success(true)
+                 }
+                 "getNativeEmergencyState" -> result.success(nativeStateMap())
++                "getPendingPoints" -> result.success(pendingPointsList())
++                "ackUploadedPoints" -> {
++                    // C-017: Dart acks uuids ONLY after the backend returned 202 for the batch.
++                    val args = call.arguments as? Map<*, *>
++                    val uuids = (args?.get("uuids") as? List<*>)?.filterIsInstance<String>()?.toSet() ?: emptySet()
++                    result.success(PocNativeState.acknowledge(uuids))
++                }
+                 else -> result.notImplemented()
+             }
+         }
+@@ -173,6 +180,7 @@ class MainActivity : FlutterActivity() {
+                 "accuracyM" to p.accuracyM,
+                 "capturedAtMs" to p.capturedAtMs,
+                 "source" to p.source,
++                "clientUuid" to p.clientUuid,
+             )
+         }
+         return mapOf(
+@@ -186,4 +194,18 @@ class MainActivity : FlutterActivity() {
+             "permissions" to permissionSnapshot(),
+         )
+     }
++
++    /** C-017: the FULL un-acked queue (not just the last 20) with stable uuids —
++     *  this is the upload source of truth; replaces reading `points` for upload. */
++    private fun pendingPointsList(): List<Map<String, Any?>> =
++        PocNativeState.pointsSnapshot().map { p ->
++            mapOf(
++                "clientUuid" to p.clientUuid,
++                "latitude" to p.latitude,
++                "longitude" to p.longitude,
++                "accuracyM" to p.accuracyM,
++                "capturedAtMs" to p.capturedAtMs,
++                "source" to p.source,
++            )
++        }
+ }
+diff --git a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/PersistentPointQueue.kt b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/PersistentPointQueue.kt
+index a12edab..4c1d63d 100644
+--- a/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/PersistentPointQueue.kt
++++ b/mobile/android/app/src/main/kotlin/com/emergency/app/emergency_poc/PersistentPointQueue.kt
+@@ -3,6 +3,7 @@ package com.emergency.app.emergency_poc
+ import android.util.Log
+ import org.json.JSONObject
+ import java.io.File
++import java.util.UUID
+ 
+ /**
+  * File-backed location point queue (Phase 5): survives process death, bounded
+@@ -11,6 +12,11 @@ import java.io.File
+  * Phase 4 discovery (docs/phase-1/4 reports): OneUI silently suspends delivery
+  * and process death loses the in-memory buffer — this queue makes points
+  * durable until they are uploaded by the Dart side (C-014 bridge).
++ *
++ * C-016/C-017: every point carries a capture-time client_uuid (survives
++ * restarts — the dedupe key C-02) and the queue exposes acknowledge() so the
++ * Dart uploader drains it ONLY after the backend accepted the batch. The queue
++ * is therefore always exactly "what the server has not yet confirmed".
+  */
+ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
+ 
+@@ -30,6 +36,18 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
+         persist()
+     }
+ 
++    /** C-017: remove acked (server-confirmed) points; returns how many were removed.
++     *  Unknown uuids are ignored — ack is idempotent. */
++    @Synchronized
++    fun acknowledge(uuids: Set<String>): Int {
++        if (uuids.isEmpty()) return 0
++        val before = points.size
++        points.removeAll { it.clientUuid in uuids }
++        val removed = before - points.size
++        if (removed > 0) persist()
++        return removed
++    }
++
+     @Synchronized
+     fun clear() {
+         points.clear()
+@@ -48,11 +66,18 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
+ 
+     private fun persist() {
+         runCatching {
+-            file.writeText(points.joinToString("\n") { serialize(it) })
++            // atomic-ish write (C-017): process death mid-write must not corrupt the queue
++            val tmp = File(file.parentFile, file.name + ".tmp")
++            tmp.writeText(points.joinToString("\n") { serialize(it) })
++            if (!tmp.renameTo(file)) {
++                file.writeText(tmp.readText())
++                tmp.delete()
++            }
+         }.onFailure { Log.e("PointQueue", "persist failed", it) }
+     }
+ 
+     private fun serialize(p: PocLocationPoint): String = JSONObject().apply {
++        put("uuid", p.clientUuid)
+         put("lat", p.latitude)
+         put("lng", p.longitude)
+         put("acc", p.accuracyM ?: JSONObject.NULL)
+@@ -72,6 +97,9 @@ class PersistentPointQueue(private val file: File, private val maxPoints: Int) {
+             bearingDeg = if (j.isNull("brg")) null else j.getDouble("brg").toFloat(),
+             capturedAtMs = j.getLong("ts"),
+             source = j.getString("src"),
++            // C-016: legacy pre-update lines have no uuid — mint one so no point is lost.
++            // One-time caveat: such legacy points may be uploaded once more (documented in phase-5-report).
++            clientUuid = if (j.isNull("uuid")) UUID.randomUUID().toString() else j.getString("uuid"),
+         )
+     }
+ }
+diff --git a/mobile/lib/core/native/emergency_native.dart b/mobile/lib/core/native/emergency_native.dart
+index 05dd82c..2d68dcc 100644
+--- a/mobile/lib/core/native/emergency_native.dart
++++ b/mobile/lib/core/native/emergency_native.dart
+@@ -24,6 +24,37 @@ class EmergencyNative {
+ 
+   Future<Map<String, dynamic>> status() => _call('getLocationServiceStatus');
+ 
++  /// C-017: the FULL un-acked native queue (stable capture-time uuids) —
++  /// the upload source of truth; survives process restarts.
++  Future<List<Map<String, dynamic>>> pendingPoints() async {
++    try {
++      final raw = await _channel.invokeMethod('getPendingPoints');
++      return (raw as List? ?? const [])
++          .whereType<Map>()
++          .map((m) => Map<String, dynamic>.from(m))
++          .toList();
++    } on PlatformException {
++      return const [];
++    } on MissingPluginException {
++      return const [];
++    }
++  }
++
++  /// C-017: acks server-confirmed points so they leave the native queue.
++  /// Returns how many were drained (0 also on channel failure — the points
++  /// simply stay pending and get re-uploaded idempotently next tick).
++  Future<int> ackUploadedPoints(List<String> uuids) async {
++    if (uuids.isEmpty) return 0;
++    try {
++      final raw = await _channel.invokeMethod('ackUploadedPoints', {'uuids': uuids});
++      return raw is num ? raw.toInt() : 0;
++    } on PlatformException {
++      return 0;
++    } on MissingPluginException {
++      return 0;
++    }
++  }
++
+   Future<Map<String, dynamic>> permissions() async {
+     final state = await status();
+     final perms = state['permissions'];
+diff --git a/mobile/lib/state/app_state.dart b/mobile/lib/state/app_state.dart
+index f258793..33beb08 100644
+--- a/mobile/lib/state/app_state.dart
++++ b/mobile/lib/state/app_state.dart
+@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
+ import '../core/api/api_client.dart';
+ import '../core/api/api_exception.dart';
+ import '../core/native/emergency_native.dart';
+-
+ import '../data/repositories_impl.dart';
+ import '../domain/entities.dart';
+ import '../domain/usecases.dart';
+@@ -40,9 +39,13 @@ class AppState extends ChangeNotifier {
+   bool busy = false;
+   Timer? _poll;
+   bool _nativeStartAttempted = false;
+-  // capturedAtMs -> client_uuid of points already handed to the upload queue;
+-  // stable keys keep backend dedupe (C-02) correct across retries.
+-  final Map<int, String> _uploadedPointKeys = {};
++  // C-016/C-017: client_uuid is born NATIVE-side at capture time and lives in the
++  // persistent queue — stable across restarts, so server dedupe (C-02) holds.
++  // This set is only a within-session upload guard (bounded, belt-and-braces).
++  final Set<String> _uploadedUuids = {};
++  // Points captured more than this before the current session's start belong to an
++  // older (already terminal) session and are discarded+acked instead of re-attributed.
++  static const int _sessionSkewSlackMs = 120000;
+ 
+   bool get isLoggedIn => user != null;
+   bool get hasActiveSession => activeSession != null && !activeSession!.status.isTerminal;
+@@ -154,7 +157,7 @@ class AppState extends ChangeNotifier {
+     try {
+       final (session, _) = await startEmergency(triggerType: 'IN_APP_SOS');
+       activeSession = session;
+-      _uploadedPointKeys.clear(); // new session, fresh dedupe keys
++      _uploadedUuids.clear(); // new session, fresh upload guard
+ 
+       // Permission gate: a fresh install has NO runtime permissions — request
+       // them and wait briefly; without fine location the FGS cannot run and
+@@ -317,58 +320,55 @@ class AppState extends ChangeNotifier {
+   bool _isIngestable(EmergencyStatus s) =>
+       s == EmergencyStatus.starting || s == EmergencyStatus.active || s == EmergencyStatus.degraded;
+ 
+-  /// Reads the native point buffer (temp bridge) and uploads unseen points.
+-  /// client_uuid keys are stable per capturedAtMs so retries dedupe on the
+-  /// server (constraint C-02) instead of creating duplicate rows.
+-
+-  /// UUID derived from session id + capture time — stable across app restarts
+-  /// (uuidV4 would break server-side dedupe after a process death, C-02).
+-  String _stablePointUuid(String sessionId, int capturedMs) {
+-    int h = 0x5a17;
+-    final src = '$sessionId:$capturedMs';
+-    for (final c in src.codeUnits) {
+-      h = (h ^ c) * 0x01000193 & 0x7fffffff;
+-    }
+-    final hex = h.toRadixString(16).padLeft(8, '0') +
+-        (capturedMs & 0xffffffff).toRadixString(16).padLeft(8, '0') +
+-        sessionId.replaceAll('-', '').substring(0, 12);
+-    final p = hex.padRight(32, '0').substring(0, 32);
+-    return '${p.substring(0, 8)}-${p.substring(8, 12)}-4${p.substring(13, 16)}-8${p.substring(17, 20)}-${p.substring(20, 32)}';
+-  }
+-
++  /// Uploads the native pending queue (temp bridge, docs/change-log.md C-014/C-016/C-017).
++  /// Correctness contract:
++  ///  - client_uuid comes FROM the native queue (born at capture time) — stable across
++  ///    retries AND process restarts, so the backend's (session, client_uuid) dedupe holds;
++  ///  - points are acked (drained) ONLY after the backend accepted the batch — a crash
++  ///    between upload and ack causes a re-upload with the SAME uuid → duplicate is
++  ///    swallowed server-side, no duplicate rows, no lost points;
++  ///  - points older than the current session's start are drained WITHOUT upload (their
++  ///    session is already terminal and can no longer receive locations).
+   Future<void> _uploadNativePoints(String sessionId) async {
+-    final nativeState = await native.status();
+-    final pointsRaw = (nativeState['points'] as List?) ?? const [];
++    final pending = await native.pendingPoints();
++    if (pending.isEmpty) return;
++
++    final startedAtMs = activeSession?.startedAt?.millisecondsSinceEpoch;
+     final batch = <Map<String, dynamic>>[];
+-    for (final p in pointsRaw) {
+-      if (p is! Map) continue;
+-      final m = Map<String, dynamic>.from(p);
+-      final capturedMs = (m['capturedAtMs'] as num?)?.toInt();
+-      if (capturedMs == null || _uploadedPointKeys.containsKey(capturedMs)) continue;
+-      // DETERMINISTIC id: same (session, capturedAt) must always map to the
+-      // same client_uuid so a re-upload after process restart dedupes on the
+-      // server (constraint C-02) instead of creating duplicate rows.
+-      final clientUuid = _stablePointUuid(sessionId, capturedMs);
+-      _uploadedPointKeys[capturedMs] = clientUuid;
++    final staleUuids = <String>[];
++    for (final p in pending) {
++      final clientUuid = (p['clientUuid'] ?? '').toString();
++      final capturedMs = (p['capturedAtMs'] as num?)?.toInt();
++      if (clientUuid.isEmpty || capturedMs == null) continue;
++      if (_uploadedUuids.contains(clientUuid)) continue;
++      if (startedAtMs != null && capturedMs < startedAtMs - _sessionSkewSlackMs) {
++        staleUuids.add(clientUuid);
++        continue;
++      }
+       batch.add({
+         'client_uuid': clientUuid,
+-        'latitude': m['latitude'],
+-        'longitude': m['longitude'],
+-        'accuracy_m': m['accuracyM'],
++        'latitude': p['latitude'],
++        'longitude': p['longitude'],
++        'accuracy_m': p['accuracyM'],
+         'captured_at': DateTime.fromMillisecondsSinceEpoch(capturedMs, isUtc: true).toIso8601String(),
+-        'source': (m['source'] ?? 'FGS_GPS').toString(),
++        'source': (p['source'] ?? 'FGS_GPS').toString(),
+       });
+     }
++
++    if (staleUuids.isNotEmpty) {
++      final drained = await native.ackUploadedPoints(staleUuids);
++      debugPrint('locations.staleDiscarded session=$sessionId requested=${staleUuids.length} drained=$drained');
++    }
+     if (batch.isEmpty) return;
+-    if (_uploadedPointKeys.length > 500) {
+-      // keep the dedupe map bounded; old keys are long-consumed points
+-      final keys = _uploadedPointKeys.keys.toList()..sort();
+-      for (final k in keys.take(_uploadedPointKeys.length - 500)) {
+-        _uploadedPointKeys.remove(k);
+-      }
++
++    await emergencyRepo.uploadLocations(sessionId, batch); // throws → nothing acked, retried next tick
++    _uploadedUuids.addAll(batch.map((b) => b['client_uuid'] as String));
++    if (_uploadedUuids.length > 500) {
++      // keep the guard bounded; acked points can never come back (drained natively)
++      _uploadedUuids.remove(_uploadedUuids.first);
+     }
+-    await emergencyRepo.uploadLocations(sessionId, batch);
+-    debugPrint('locations.uploaded session=$sessionId count=${batch.length}');
++    final drained = await native.ackUploadedPoints(batch.map((b) => b['client_uuid'] as String).toList());
++    debugPrint('locations.uploaded session=$sessionId count=${batch.length} drained=$drained');
+   }
+ 
+   Future<void> _finishIfTerminal() async {

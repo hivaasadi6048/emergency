@@ -5,7 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../core/api/api_client.dart';
 import '../core/api/api_exception.dart';
 import '../core/native/emergency_native.dart';
-import '../core/uuid.dart';
+
 import '../data/repositories_impl.dart';
 import '../domain/entities.dart';
 import '../domain/usecases.dart';
@@ -320,6 +320,22 @@ class AppState extends ChangeNotifier {
   /// Reads the native point buffer (temp bridge) and uploads unseen points.
   /// client_uuid keys are stable per capturedAtMs so retries dedupe on the
   /// server (constraint C-02) instead of creating duplicate rows.
+
+  /// UUID derived from session id + capture time — stable across app restarts
+  /// (uuidV4 would break server-side dedupe after a process death, C-02).
+  String _stablePointUuid(String sessionId, int capturedMs) {
+    int h = 0x5a17;
+    final src = '$sessionId:$capturedMs';
+    for (final c in src.codeUnits) {
+      h = (h ^ c) * 0x01000193 & 0x7fffffff;
+    }
+    final hex = h.toRadixString(16).padLeft(8, '0') +
+        (capturedMs & 0xffffffff).toRadixString(16).padLeft(8, '0') +
+        sessionId.replaceAll('-', '').substring(0, 12);
+    final p = hex.padRight(32, '0').substring(0, 32);
+    return '${p.substring(0, 8)}-${p.substring(8, 12)}-4${p.substring(13, 16)}-8${p.substring(17, 20)}-${p.substring(20, 32)}';
+  }
+
   Future<void> _uploadNativePoints(String sessionId) async {
     final nativeState = await native.status();
     final pointsRaw = (nativeState['points'] as List?) ?? const [];
@@ -329,7 +345,10 @@ class AppState extends ChangeNotifier {
       final m = Map<String, dynamic>.from(p);
       final capturedMs = (m['capturedAtMs'] as num?)?.toInt();
       if (capturedMs == null || _uploadedPointKeys.containsKey(capturedMs)) continue;
-      final clientUuid = uuidV4();
+      // DETERMINISTIC id: same (session, capturedAt) must always map to the
+      // same client_uuid so a re-upload after process restart dedupes on the
+      // server (constraint C-02) instead of creating duplicate rows.
+      final clientUuid = _stablePointUuid(sessionId, capturedMs);
       _uploadedPointKeys[capturedMs] = clientUuid;
       batch.add({
         'client_uuid': clientUuid,

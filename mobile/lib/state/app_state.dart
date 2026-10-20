@@ -320,6 +320,9 @@ class AppState extends ChangeNotifier {
   bool _isIngestable(EmergencyStatus s) =>
       s == EmergencyStatus.starting || s == EmergencyStatus.active || s == EmergencyStatus.degraded;
 
+  /// C-019: round to 6 decimal places so the coordinate fits DecimalField(9,6).
+  double _round6(num v) => (v * 1e6).roundToDouble() / 1e6;
+
   /// Uploads the native pending queue (temp bridge, docs/change-log.md C-014/C-016/C-017).
   /// Correctness contract:
   ///  - client_uuid comes FROM the native queue (born at capture time) — stable across
@@ -347,8 +350,12 @@ class AppState extends ChangeNotifier {
       }
       batch.add({
         'client_uuid': clientUuid,
-        'latitude': p['latitude'],
-        'longitude': p['longitude'],
+        // C-019: server stores lat/lng as DecimalField(max_digits=9, decimal_places=6);
+        // raw GPS doubles (~15 decimal digits) are REJECTED per-point server-side
+        // (accepted=0, reason max_digits). 6 decimals ≈ 0.11 m — far below GPS
+        // accuracy, so nothing meaningful is lost by rounding.
+        'latitude': _round6(p['latitude'] as num),
+        'longitude': _round6(p['longitude'] as num),
         'accuracy_m': p['accuracyM'],
         'captured_at': DateTime.fromMillisecondsSinceEpoch(capturedMs, isUtc: true).toIso8601String(),
         'source': (p['source'] ?? 'FGS_GPS').toString(),

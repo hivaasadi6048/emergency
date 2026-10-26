@@ -31,6 +31,10 @@ class AppState extends ChangeNotifier {
 
   UserEntity? user;
   String? lastError;
+  // C-023: which stable code lastError came from (null when cleared) — lets the
+  // polling tick clear a stale TRANSIENT (connectivity) banner after recovery
+  // without touching standing errors (e.g. the location-permission guidance).
+  String? _lastErrorCode;
 
   List<ContactEntity> contacts = [];
   SessionEntity? activeSession;
@@ -50,6 +54,27 @@ class AppState extends ChangeNotifier {
   bool get isLoggedIn => user != null;
   bool get hasActiveSession => activeSession != null && !activeSession!.status.isTerminal;
 
+  /// C-020: the auth session died server-side (e.g. dev server restarted with a new
+  /// signing key) — ApiClient already cleared the dead tokens. Stop the polling loop
+  /// and drop ONLY the auth identity: the backend session stays open and the native
+  /// FGS keeps buffering points into the persistent queue, so after re-login
+  /// [refreshActiveFromBackend] resumes the SAME session and drains the backlog.
+  void _handleAuthExpired() {
+    _stopPolling();
+    user = null;
+    lastError = 'نشست شما منقضی شده است؛ لطفاً دوباره وارد شوید. '
+        'سشن فعال و نقاط ثبت‌شده حفظ می‌شوند و بعد از ورود دوباره ادامه پیدا می‌کنند.';
+    notifyListeners();
+  }
+
+  /// Funnel for repository-call catches: an unrecoverable 401 must log the UI out
+  /// (HomeShell listens on user==null) instead of just showing an error banner.
+  bool _maybeAuthExpired(ApiException e) {
+    if (e.code != 'AUTH_EXPIRED') return false;
+    _handleAuthExpired();
+    return true;
+  }
+
   // ── auth ────────────────────────────────────────────────────────────────
   /// Returns the dev-mode code when the backend provides one; empty string on
   /// success WITHOUT a code (cloud/test-mode server); null on failure.
@@ -60,7 +85,7 @@ class AppState extends ChangeNotifier {
       final code = await authRepo.requestOtp(phone);
       return code ?? '';
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      _setError(e.persianMessage, e.code);
       notifyListeners();
       return null;
     }
@@ -75,7 +100,7 @@ class AppState extends ChangeNotifier {
       await refreshActiveFromBackend();
       return true;
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
       return false;
     } finally {
       busy = false;
@@ -101,6 +126,8 @@ class AppState extends ChangeNotifier {
     activeSession = null;
     contacts = [];
     notifyListeners();
+    // C-020: navigation to /login is centralized in HomeShell's auth listener
+    // (single code path for manual logout AND server-side session death).
   }
 
   // ── contacts ────────────────────────────────────────────────────────────
@@ -109,7 +136,7 @@ class AppState extends ChangeNotifier {
       contacts = await contactRepo.list();
       notifyListeners();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
     }
   }
 
@@ -119,7 +146,7 @@ class AppState extends ChangeNotifier {
       await loadContacts();
       return true;
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      _setError(e.persianMessage, e.code);
       notifyListeners();
       return false;
     }
@@ -131,7 +158,7 @@ class AppState extends ChangeNotifier {
       await loadContacts();
       return true;
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      _setError(e.persianMessage, e.code);
       notifyListeners();
       return false;
     }
@@ -142,7 +169,7 @@ class AppState extends ChangeNotifier {
       await contactRepo.delete(id);
       await loadContacts();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      _setError(e.persianMessage, e.code);
       notifyListeners();
     }
   }
@@ -188,7 +215,7 @@ class AppState extends ChangeNotifier {
       _nativeStartAttempted = true;
       _startPolling();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      _setError(e.persianMessage, e.code);
     } finally {
       busy = false;
       notifyListeners();
@@ -204,7 +231,7 @@ class AppState extends ChangeNotifier {
       activeSession = await emergencyRepo.resolve(session.id);
       await _finishIfTerminal();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
     } finally {
       busy = false;
       notifyListeners();
@@ -220,7 +247,7 @@ class AppState extends ChangeNotifier {
       activeSession = await emergencyRepo.cancel(session.id);
       await _finishIfTerminal();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
     } finally {
       busy = false;
       notifyListeners();
@@ -239,7 +266,7 @@ class AppState extends ChangeNotifier {
       history = await emergencyRepo.history();
       notifyListeners();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
     }
   }
 
@@ -248,7 +275,7 @@ class AppState extends ChangeNotifier {
       activeEvents = await emergencyRepo.events(sessionId);
       notifyListeners();
     } on ApiException catch (e) {
-      _setError(e.persianMessage);
+      if (!_maybeAuthExpired(e)) _setError(e.persianMessage, e.code);
     }
   }
 
@@ -264,8 +291,9 @@ class AppState extends ChangeNotifier {
         _startPolling();
       }
       notifyListeners();
-    } on ApiException {
+    } on ApiException catch (e) {
       // offline at startup — SOS screen still usable, poll will retry
+      _maybeAuthExpired(e); // C-020: dead session right after login → route to login
     }
   }
 
@@ -309,9 +337,23 @@ class AppState extends ChangeNotifier {
         await native.stopLocationService(); // privacy: stop collection when session ends
         _stopPolling();
       }
-    } on ApiException {
+    } on ApiException catch (e) {
+      if (e.code == 'AUTH_EXPIRED') {
+        // C-020: dead auth session → stop the 401 loop, drop identity, let the
+        // HomeShell listener route back to login. The native FGS + persistent queue
+        // keep buffering; re-login resumes the same session and drains the backlog.
+        _handleAuthExpired();
+        return;
+      }
       // transient (offline/backend down): keep last known state, retry next tick
+      notifyListeners();
+      return;
     }
+    // C-023: this tick fully succeeded — data flows again, so a stale
+    // connectivity banner set during an outage must disappear instead of
+    // sticking around after recovery (device test 2026-10-26, 30-min outage:
+    // the «ارتباط با سرور برقرار نشد» banner stayed even after accepted=16).
+    if (_lastErrorCode == 'NETWORK') _setError(null);
     notifyListeners();
   }
 
@@ -387,5 +429,8 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  void _setError(String? message) => lastError = message;
+  void _setError(String? message, [String? code]) {
+    lastError = message;
+    _lastErrorCode = message == null ? null : code;
+  }
 }

@@ -17,6 +17,8 @@ class ApiException implements Exception {
         return 'اطلاعات وارد شده معتبر نیست.';
       case 'UNAUTHORIZED':
         return 'ورود دوباره لازم است.';
+      case 'AUTH_EXPIRED':
+        return 'نشست شما منقضی شده است؛ لطفاً دوباره وارد شوید.';
       case 'FORBIDDEN':
         return 'دسترسی مجاز نیست.';
       case 'NOT_FOUND':

@@ -115,8 +115,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.logout),
             title: const Text('خروج'),
             onTap: () async {
+              // C-020: navigation is centralized — HomeShell's auth listener routes
+              // to /login when AppState drops the user (covers manual logout AND
+              // server-side session death with one code path; no double navigation).
               await state.logout();
-              if (context.mounted) Navigator.of(context).pushReplacementNamed('/login');
             },
           ),
         ),

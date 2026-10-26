@@ -61,6 +61,29 @@ class _HomeShellState extends State<HomeShell> {
   int _tab = 0;
 
   @override
+  void initState() {
+    super.initState();
+    // C-020: auth is reactive — when AppState drops `user` (manual logout OR
+    // server-side session death via AUTH_EXPIRED), route back to login from ONE
+    // place. Previously only manual logout navigated; a dead session left the user
+    // stuck on the emergency screen behind an endless 401 loop.
+    widget.state.addListener(_onAuthChanged);
+  }
+
+  void _onAuthChanged() {
+    if (!mounted) return;
+    if (!widget.state.isLoggedIn) {
+      Navigator.of(context).pushReplacementNamed('/login');
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.state.removeListener(_onAuthChanged);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final screens = [
       EmergencyScreen(state: widget.state),
